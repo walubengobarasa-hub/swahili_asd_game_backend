@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+sqlalchemy>=2.0
+psycopg2-binary
+pydantic
+python-multipart
+transformers
+torch
+sentencepiece
+accelerate
