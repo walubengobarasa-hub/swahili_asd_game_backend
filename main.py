@@ -181,6 +181,51 @@ def validate_ai_sentence(sentence: str, allowed_sw_words: set, max_words: int = 
 
     return True, "OK"
 
+def build_match_word_task(topic: str, target: LexiconItem, options: List[LexiconItem]) -> Dict[str, Any]:
+    def img_url(li: LexiconItem) -> str:
+        if not li.image_asset_id:
+            return ""
+        return f"/assets/images/{li.image_asset_id}.png"
+
+    payload = {
+        "task_type": "match_word",  # ✅ new type
+        "prompt_sw": "Chagua neno sahihi.",
+        "target_lexicon_id": int(target.id),
+        "prompt_image_url": img_url(target),
+        "options": [
+            {"lexicon_id": int(o.id), "label_sw": o.sw_word}
+            for o in options
+        ],
+        "correct_lexicon_id": int(target.id),
+        "feedback": {
+            "correct_sw": f"Sawa! Hiyo ni {target.sw_word}.",
+            "wrong_sw": "Jaribu tena. Chagua neno sahihi."
+        }
+    }
+    return payload
+def build_sentence_builder_task(topic: str, target: LexiconItem) -> Dict[str, Any]:
+    # very literal, predictable, short
+    subject_tiles = ["Mimi", "Yeye"]
+    verb_tiles = ["Ninakula", "Ninapenda", "Ninaona"]
+    obj_tiles = [target.sw_word, "ndizi", "maji"]
+
+    correct = ["Mimi", "Ninaona", target.sw_word]
+
+    tiles = (
+        [{"text": t, "slot": "SUBJECT"} for t in subject_tiles] +
+        [{"text": t, "slot": "VERB"} for t in verb_tiles] +
+        [{"text": t, "slot": "OBJECT"} for t in obj_tiles]
+    )
+    random.shuffle(tiles)
+
+    return {
+        "task_type": "sentence_builder",
+        "prompt_sw": "Tengeneza sentensi.",
+        "slots": ["SUBJECT", "VERB", "OBJECT"],
+        "tiles": tiles,
+        "correct": correct,
+        "feedback": {"correct_sw": "Vizuri!", "wrong_sw": "Jaribu tena."}
+    }
 
 # =========================
 # Adaptive logic (simple + explainable)
@@ -437,6 +482,27 @@ def submit_task(req: SubmitTaskRequest):
             correct = payload.get("correct")
             is_correct = (str(req.answer).strip().lower() == str(correct).strip().lower())
             # no lexicon id always available, so skip mastery update unless embedded
+        elif ttype == "match_word":
+            correct_id = payload.get("correct_lexicon_id")
+            is_correct = False
+            if req.answer:
+                try:
+                    is_correct = (int(req.answer) == int(correct_id))
+                except ValueError:
+                    is_correct = False
+            target_lex_id = payload.get("target_lexicon_id") or correct_id
+            if target_lex_id:
+                update_mastery(db, req.child_id, int(target_lex_id), is_correct)
+
+        elif ttype == "sentence_builder":
+            # answer is JSON list string like '["Mimi","Ninaona","mbwa"]'
+            is_correct = False
+            try:
+                ans = json.loads(req.answer or "[]")
+                is_correct = (ans == payload.get("correct"))
+            except Exception:
+                is_correct = False
+    
         else:
             # default safe behavior
             is_correct = False
@@ -518,10 +584,63 @@ def get_next_task_internal(db, session_id: int, child_id: int) -> Task:
     )
     if ai_task:
         return ai_task
+    # 1b) Try pool AI tasks (teacher approved), stored under child_id=0 topic session
+    pool = db.query(Session).filter(Session.child_id == 0, Session.lesson_focus == topic).first()
+    if pool:
+        pool_ai = (
+            db.query(Task)
+            .filter(
+                Task.session_id == int(pool.id),
+                Task.generated_by == "ai",
+                Task.approved == True,
+                Task.difficulty.between(max(1, next_diff-1), min(5, next_diff+1))
+            )
+            .order_by(Task.created_at.desc())
+            .first()
+        )
+        if pool_ai:
+            return pool_ai
 
     # 2) Otherwise: generate a template task and store it
+    # rotate task types for MVP
+    cycle = ["match_image", "match_word", "fill_blank", "sentence_builder"]
+    idx = len(attempts) % len(cycle)
+    next_type = cycle[idx]
+
     target, options = pick_target_and_options(db, topic)
-    payload = build_match_image_task(topic, target, options)
+
+    if next_type == "match_image":
+        payload = build_match_image_task(topic, target, options)
+        task_type = "match_image"
+        modality = "image"
+
+    elif next_type == "match_word":
+        payload = build_match_word_task(topic, target, options)
+        task_type = "match_word"
+        modality = "mixed"
+
+    elif next_type == "fill_blank":
+        payload = build_fill_blank_task(target)
+        task_type = "fill_blank"
+        modality = "text"
+
+    else:  # sentence_builder
+        payload = build_sentence_builder_task(topic, target)
+        task_type = "sentence_builder"
+        modality = "mixed"
+
+    return store_task(
+        db=db,
+        session_id=session_id,
+        task_type=task_type,
+        target_skill="vocabulary",
+        difficulty=next_diff,
+        modality=modality,
+        payload=payload,
+        generated_by="template",
+        approved=True
+    )
+
 
     return store_task(
         db=db,
@@ -685,12 +804,89 @@ def report_child(child_id: int):
         total = len(rows)
         correct = sum(1 for r in rows if r[0] is True)
         acc = (correct / total) if total else 0.0
-
+        
         return {
             "child_id": child_id,
             "total_attempts": total,
             "correct": correct,
             "accuracy": round(acc, 3)
         }
+    finally:
+        db.close()
+@app.get("/topics")
+def list_topics():
+    db = SessionLocal()
+    try:
+        rows = db.query(Topic).filter(Topic.is_active == True).order_by(Topic.id.asc()).all()
+        return [{"key": r.key, "label_sw": r.label_sw, "label_en": r.label_en} for r in rows]
+    finally:
+        db.close()
+@app.get("/teacher/ai/pending")
+def teacher_pending_ai(topic: Optional[str] = None, limit: int = 30):
+    db = SessionLocal()
+    try:
+        q = db.query(Task).filter(Task.generated_by == "ai", Task.approved == False)
+        if topic:
+            # topic is stored in the pool session lesson_focus
+            q = q.join(Session, Task.session_id == Session.id).filter(Session.lesson_focus == topic)
+        rows = q.order_by(Task.created_at.desc()).limit(limit).all()
+        out = []
+        for t in rows:
+            out.append({
+                "task_id": int(t.id),
+                "task_type": t.task_type,
+                "difficulty": int(t.difficulty),
+                "payload": t.payload_json,
+                "created_at": t.created_at.isoformat() if t.created_at else None
+            })
+        return out
+    finally:
+        db.close()
+class ApproveTaskRequest(BaseModel):
+    task_id: int
+    approved: bool = True
+
+@app.post("/teacher/ai/approve")
+def teacher_approve(req: ApproveTaskRequest):
+    db = SessionLocal()
+    try:
+        t = db.query(Task).filter(Task.id == req.task_id, Task.generated_by == "ai").first()
+        if not t:
+            raise HTTPException(status_code=404, detail="AI task not found")
+        t.approved = bool(req.approved)
+        db.commit()
+        return {"ok": True, "task_id": int(t.id), "approved": bool(t.approved)}
+    finally:
+        db.close()
+@app.get("/caregiver/settings/{child_id}")
+def get_caregiver_settings(child_id: int):
+    db = SessionLocal()
+    try:
+        s = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == child_id).first()
+        if not s:
+            return {"child_id": child_id, "session_minutes": 10, "sound_on": True}
+        return {"child_id": child_id, "session_minutes": s.session_minutes, "sound_on": s.sound_on}
+    finally:
+        db.close()
+
+
+class UpdateCaregiverSettingsRequest(BaseModel):
+    child_id: int
+    session_minutes: int = 10
+    sound_on: bool = True
+
+@app.post("/caregiver/settings")
+def update_caregiver_settings(req: UpdateCaregiverSettingsRequest):
+    db = SessionLocal()
+    try:
+        s = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == req.child_id).first()
+        if not s:
+            s = CaregiverSettings(child_id=req.child_id, session_minutes=req.session_minutes, sound_on=req.sound_on)
+            db.add(s)
+        else:
+            s.session_minutes = req.session_minutes
+            s.sound_on = req.sound_on
+        db.commit()
+        return {"ok": True}
     finally:
         db.close()
