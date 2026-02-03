@@ -3,12 +3,12 @@ import json
 import random
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-
+from sqlalchemy import and_
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, Text, Boolean, SmallInteger,
     DateTime, ForeignKey, Numeric, JSON
@@ -26,19 +26,39 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 # ENV + APP
 # =========================
 load_dotenv()
+app = FastAPI(title="Swahili ASD Game API", version="0.1.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "google/mt5-small")
 ASSETS_DIR = os.getenv("ASSETS_DIR", "assets")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, ASSETS_DIR)
 AUTO_APPROVE_AI = os.getenv("AUTO_APPROVE_AI", "false").lower() == "true"
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set. Put it in .env")
 
-app = FastAPI(title="Swahili ASD Game Backend", version="0.1.0")
 
-# Serve static assets (images/audio)
-# Access images like: GET /assets/images/img_dog.png
+# ✅ CORS for Expo web dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:19006",
+        "http://127.0.0.1:19006",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ✅ Serve static assets (images/audio)
+# URL: http://127.0.0.1:8000/assets/images/img_dog.png
+if not os.path.isdir(ASSETS_DIR):
+    print(f"[WARN] ASSETS_DIR '{ASSETS_DIR}' does not exist. Create it or update .env")
+
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 
@@ -68,6 +88,13 @@ class LexiconItem(Base):
     image_asset_id = Column(Text)   # asset_key
     audio_asset_id = Column(Text)   # asset_key
 
+class CaregiverSettings(Base):
+    __tablename__ = "caregiver_settings"
+
+    child_id = Column(BigInteger, primary_key=True)
+    session_minutes = Column(Integer, nullable=False, default=10)
+    sound_on = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -132,12 +159,30 @@ class AIGenerationLog(Base):
     validation_ok = Column(Boolean, nullable=False)
     notes = Column(Text, nullable=True)
 
+class LexiconBulkItem(BaseModel):
+    topic: str
+    pos: str = "noun"
+    difficulty: int = 1
+    en_word: str
+    sw_word: str
+    example_sw: Optional[str] = None
+    example_en: Optional[str] = None
+    tags: Optional[str] = None
+    image_asset_id: Optional[str] = None
+    audio_asset_id: Optional[str] = None
+
+class LexiconBulkResponse(BaseModel):
+    ok: bool
+    inserted: int
+    updated: int
+    skipped: int
+    ids: List[int] = []
 
 # =========================
 # GenAI: load once
 # =========================
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME,token=HF_TOKEN)
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME,token=HF_TOKEN)
 
 def mt5_generate(text: str, max_new_tokens: int = 60) -> str:
     inputs = tokenizer(text, return_tensors="pt", truncation=True)
@@ -409,18 +454,21 @@ def get_allowed_lexicon_for_topic(db, topic: str) -> List[LexiconItem]:
     return db.query(LexiconItem).filter(LexiconItem.topic == topic).all()
 
 
-def pick_target_and_options(db, topic: str) -> (LexiconItem, List[LexiconItem]):
+def pick_target_and_options(db, topic: str):
     items = get_allowed_lexicon_for_topic(db, topic)
-    items = [i for i in items if i.image_asset_id]  # for image match tasks
     if len(items) < 4:
-        raise HTTPException(status_code=400, detail=f"Not enough items with images for topic '{topic}' (need 4).")
+        raise HTTPException(status_code=400, detail=f"Not enough lexicon items for topic '{topic}' (need 4).")
 
     target = random.choice(items)
     pool = [i for i in items if i.id != target.id]
-    options = random.sample(pool, k=3) + [target]
+    options = random.sample(pool, k=min(3, len(pool))) + [target]
+    # Ensure we have exactly 4 options if possible
+    while len(options) < 4 and pool:
+        cand = random.choice(pool)
+        if cand not in options:
+            options.append(cand)
     random.shuffle(options)
     return target, options
-
 
 # =========================
 # ENDPOINTS
@@ -609,15 +657,36 @@ def get_next_task_internal(db, session_id: int, child_id: int) -> Task:
 
     target, options = pick_target_and_options(db, topic)
 
+        # 2) Otherwise: generate a template task and store it
+    cycle = ["match_image", "match_word", "fill_blank", "sentence_builder"]
+    idx = len(attempts) % len(cycle)
+    next_type = cycle[idx]
+
+    # Pick from all items; only match_image requires images
+    target, options = pick_target_and_options(db, topic)
+
     if next_type == "match_image":
-        payload = build_match_image_task(topic, target, options)
-        task_type = "match_image"
-        modality = "image"
+        # ensure we have enough image-backed items
+        items_img = [i for i in get_allowed_lexicon_for_topic(db, topic) if i.image_asset_id]
+        if len(items_img) >= 4:
+            target = random.choice(items_img)
+            pool = [i for i in items_img if i.id != target.id]
+            options = random.sample(pool, 3) + [target]
+            random.shuffle(options)
+
+            payload = build_match_image_task(topic, target, options)
+            task_type = "match_image"
+            modality = "image"
+        else:
+            # fallback to word matching if not enough images
+            payload = build_match_word_task(topic, target, options)
+            task_type = "match_word"
+            modality = "text"
 
     elif next_type == "match_word":
         payload = build_match_word_task(topic, target, options)
         task_type = "match_word"
-        modality = "mixed"
+        modality = "text"   # ✅ must satisfy DB constraint (no "mixed")
 
     elif next_type == "fill_blank":
         payload = build_fill_blank_task(target)
@@ -627,7 +696,7 @@ def get_next_task_internal(db, session_id: int, child_id: int) -> Task:
     else:  # sentence_builder
         payload = build_sentence_builder_task(topic, target)
         task_type = "sentence_builder"
-        modality = "mixed"
+        modality = "text"   # ✅ must satisfy DB constraint (no "mixed")
 
     return store_task(
         db=db,
@@ -638,7 +707,7 @@ def get_next_task_internal(db, session_id: int, child_id: int) -> Task:
         modality=modality,
         payload=payload,
         generated_by="template",
-        approved=True
+        approved=True,
     )
 
 
@@ -858,18 +927,6 @@ def teacher_approve(req: ApproveTaskRequest):
         return {"ok": True, "task_id": int(t.id), "approved": bool(t.approved)}
     finally:
         db.close()
-@app.get("/caregiver/settings/{child_id}")
-def get_caregiver_settings(child_id: int):
-    db = SessionLocal()
-    try:
-        s = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == child_id).first()
-        if not s:
-            return {"child_id": child_id, "session_minutes": 10, "sound_on": True}
-        return {"child_id": child_id, "session_minutes": s.session_minutes, "sound_on": s.sound_on}
-    finally:
-        db.close()
-
-
 class UpdateCaregiverSettingsRequest(BaseModel):
     child_id: int
     session_minutes: int = 10
@@ -881,12 +938,95 @@ def update_caregiver_settings(req: UpdateCaregiverSettingsRequest):
     try:
         s = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == req.child_id).first()
         if not s:
-            s = CaregiverSettings(child_id=req.child_id, session_minutes=req.session_minutes, sound_on=req.sound_on)
+            s = CaregiverSettings(
+                child_id=req.child_id,
+                session_minutes=req.session_minutes,
+                sound_on=req.sound_on,
+            )
             db.add(s)
         else:
             s.session_minutes = req.session_minutes
             s.sound_on = req.sound_on
+
         db.commit()
         return {"ok": True}
+    finally:
+        db.close()
+@app.get("/debug/assets-path")
+def debug_assets_path():
+    return {
+        "ASSETS_DIR": ASSETS_DIR,
+        "exists": os.path.exists(ASSETS_DIR),
+        "images_exists": os.path.exists(os.path.join(ASSETS_DIR, "images")),
+        "sample_img": os.path.exists(os.path.join(ASSETS_DIR, "images", "img_dog.png")),
+    }
+@app.post("/teacher/lexicon/bulk", response_model=LexiconBulkResponse)
+def teacher_lexicon_bulk(items: List[LexiconBulkItem]):
+    """
+    Bulk upsert lexicon items.
+    - If (topic + sw_word) exists -> update it
+    - Else -> insert new
+    Appears automatically in Swagger once this exists.
+    """
+    db = SessionLocal()
+    try:
+        inserted = 0
+        updated = 0
+        skipped = 0
+        ids: List[int] = []
+
+        for it in items:
+            # basic safety trims
+            topic = (it.topic or "").strip().lower()
+            sw = (it.sw_word or "").strip().lower()
+            en = (it.en_word or "").strip().lower()
+
+            if not topic or not sw or not en:
+                skipped += 1
+                continue
+
+            # "upsert" key: topic + sw_word (simple + stable)
+            existing = (
+                db.query(LexiconItem)
+                .filter(and_(LexiconItem.topic == topic, LexiconItem.sw_word == sw))
+                .first()
+            )
+
+            if existing:
+                existing.pos = (it.pos or existing.pos or "noun").strip().lower()
+                existing.difficulty = int(it.difficulty or existing.difficulty or 1)
+                existing.en_word = en
+                existing.sw_word = sw
+                existing.example_sw = it.example_sw
+                existing.example_en = it.example_en
+                existing.tags = it.tags
+                existing.image_asset_id = it.image_asset_id
+                existing.audio_asset_id = it.audio_asset_id
+                updated += 1
+                ids.append(int(existing.id))
+            else:
+                row = LexiconItem(
+                    topic=topic,
+                    pos=(it.pos or "noun").strip().lower(),
+                    difficulty=int(it.difficulty or 1),
+                    en_word=en,
+                    sw_word=sw,
+                    example_sw=it.example_sw,
+                    example_en=it.example_en,
+                    tags=it.tags,
+                    image_asset_id=it.image_asset_id,
+                    audio_asset_id=it.audio_asset_id,
+                )
+                db.add(row)
+                db.flush()  # assigns id without full commit yet
+                inserted += 1
+                ids.append(int(row.id))
+
+        db.commit()
+        return LexiconBulkResponse(ok=True, inserted=inserted, updated=updated, skipped=skipped, ids=ids)
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Bulk lexicon upload failed: {str(e)}")
     finally:
         db.close()
