@@ -9,3 +9,7 @@ transformers
 torch
 sentencepiece
 accelerate
+bcrypt
+PyJWT
+tiktoken
+protobuf>=3.12.1
