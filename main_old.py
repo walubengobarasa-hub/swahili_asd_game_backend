@@ -444,22 +444,13 @@ class SubmitTaskResponse(BaseModel):
 
 class ChildReportResponse(BaseModel):
     child_id: int
-    child_name: str
-    current_level: int = 1
-    max_level: int = 5
     total_attempts: int
     correct: int
     accuracy: float
     avg_response_time_ms: int = 0
     current_streak: int = 0
     points_last_7_days: List[Dict[str, Any]] = []
-    performance_trend: List[Dict[str, Any]] = []
     modality_breakdown: List[Dict[str, Any]] = []
-    skill_breakdown: List[Dict[str, Any]] = []
-    task_success_rates: List[Dict[str, Any]] = []
-    strengths: List[Dict[str, Any]] = []
-    weaknesses: List[Dict[str, Any]] = []
-    recent_activity: List[Dict[str, Any]] = []
 
 
 class SettingsResponse(BaseModel):
@@ -1099,237 +1090,6 @@ def teacher_import_csv_file(
     return _import_csv_rows(db, rows)
 
 
-
-
-def _child_owned_by_user(db, child_id: int, user: Optional[User], allow_teacher: bool = False) -> Child:
-    child = db.query(Child).filter(Child.id == child_id).first()
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
-    if allow_teacher and user and user.role == "teacher":
-        return child
-    if not user or user.role != "caregiver":
-        raise HTTPException(status_code=403, detail="Caregiver login required")
-    if int(child.caregiver_id or 0) != int(user.id):
-        raise HTTPException(status_code=403, detail="You do not have access to this child")
-    return child
-
-
-def _session_owned_by_user(db, session_id: int, child_id: int, user: Optional[User], allow_teacher: bool = False) -> Session:
-    session = db.query(Session).filter(Session.id == session_id, Session.child_id == child_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    _child_owned_by_user(db, child_id, user, allow_teacher=allow_teacher)
-    return session
-
-
-def _infer_difficulty_from_session(db, session_id: int, child: Child) -> int:
-    base_level = int(getattr(child, "current_level", 1) or 1)
-    base_level = max(int(getattr(child, "min_level", 1) or 1), min(5, base_level))
-
-    recent_attempts = (
-        db.query(TaskAttempt)
-        .join(Task, Task.id == TaskAttempt.task_id)
-        .filter(Task.session_id == session_id, TaskAttempt.child_id == child.id)
-        .order_by(TaskAttempt.id.desc())
-        .limit(2)
-        .all()
-    )
-
-    if len(recent_attempts) >= 2 and all(bool(a.is_correct) for a in recent_attempts):
-        return min(5, base_level + 1)
-
-    if len(recent_attempts) >= 2 and all(not bool(a.is_correct) for a in recent_attempts):
-        return max(int(getattr(child, "min_level", 1) or 1), base_level - 1)
-
-    return base_level
-
-
-def _image_or_tags_url(li: Optional[LexiconItem]) -> Optional[str]:
-    if not li:
-        return None
-    direct = _asset_url(getattr(li, "image_asset_id", None), "images")
-    if direct:
-        return direct
-    tags = str(getattr(li, "tags", "") or "")
-    m = re.search(r"(?:^|;)image_url=([^;]+)", tags)
-    return m.group(1) if m else None
-
-
-def _build_match_image_task(topic_key: str, target: LexiconItem, options: List[LexiconItem], difficulty: int) -> Dict[str, Any]:
-    tiles = []
-    for li in options:
-        tiles.append(
-            {
-                "lexicon_id": int(li.id),
-                "label_sw": li.sw_word,
-                "label_en": li.en_word,
-                "image_url": _image_or_tags_url(li),
-                "audio_url": _asset_url(li.audio_asset_id, "audio"),
-            }
-        )
-
-    random.shuffle(tiles)
-
-    prompt_text = {
-        1: f"Tambua {target.sw_word}",
-        2: f"Chagua picha ya {target.sw_word}",
-        3: f"Tazama vizuri. Wapi ni {target.sw_word}?",
-        4: f"Tofautisha {target.sw_word} na wanyama wanaofanana.",
-        5: f"Changamoto: Tambua {target.sw_word} kati ya chaguo zinazofanana sana.",
-    }.get(int(difficulty), f"Chagua picha ya {target.sw_word}")
-
-    return {
-        "topic": topic_key,
-        "task_type": "match_image",
-        "prompt_sw": prompt_text,
-        "prompt_en": f"Choose the image for {target.en_word}",
-        "prompt_audio_url": _asset_url(target.audio_asset_id, "audio"),
-        "target": {
-            "lexicon_id": int(target.id),
-            "label_sw": target.sw_word,
-            "label_en": target.en_word,
-            "image_url": _image_or_tags_url(target),
-            "audio_url": _asset_url(target.audio_asset_id, "audio"),
-        },
-        "options": tiles,
-        "answer": str(target.id),
-        "feedback": {
-            "correct_sw": "Vizuri sana!",
-            "wrong_sw": "Jaribu tena.",
-        },
-        "meta": {
-            "difficulty": int(difficulty),
-            "visual_focus": True,
-        },
-    }
-
-
-def _report_for_child(db, child_id: int) -> Dict[str, Any]:
-    child = db.query(Child).filter(Child.id == child_id).first()
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
-
-    attempts = (
-        db.query(TaskAttempt, Task, Session)
-        .join(Task, Task.id == TaskAttempt.task_id)
-        .join(Session, Session.id == Task.session_id)
-        .filter(TaskAttempt.child_id == child_id)
-        .order_by(TaskAttempt.created_at.asc(), TaskAttempt.id.asc())
-        .all()
-    )
-
-    total = len(attempts)
-    correct = sum(1 for attempt, _task, _session in attempts if bool(attempt.is_correct))
-    accuracy = round((correct / total) if total else 0.0, 4)
-    avg_response_time_ms = int(round(sum(max(0, int(attempt.response_time_ms or 0)) for attempt, _task, _session in attempts) / total)) if total else 0
-
-    current_streak = 0
-    for attempt, _task, _session in reversed(attempts):
-        if bool(attempt.is_correct):
-            current_streak += 1
-        else:
-            break
-
-    today = datetime.now(timezone.utc).date()
-    points_last_7_days = []
-    performance_trend = []
-    for offset in range(6, -1, -1):
-        day = today - timedelta(days=offset)
-        day_attempts = [attempt for attempt, _task, _session in attempts if getattr(attempt, "created_at", None) and attempt.created_at.date() == day]
-        day_correct = sum(1 for attempt in day_attempts if bool(attempt.is_correct))
-        day_total = len(day_attempts)
-        entry = {
-            "date": day.isoformat(),
-            "label": day.strftime("%a"),
-            "points": int(day_correct),
-        }
-        points_last_7_days.append(entry)
-        performance_trend.append({
-            "date": day.isoformat(),
-            "label": day.strftime("%a"),
-            "attempts": int(day_total),
-            "correct": int(day_correct),
-            "accuracy": round((day_correct / day_total) if day_total else 0.0, 4),
-        })
-
-    modality_rollup = {}
-    topic_rollup = {}
-    task_type_rollup = {}
-
-    for attempt, task, session in attempts:
-        modality = (getattr(task, "modality", None) or "mixed").strip() or "mixed"
-        modality_bucket = modality_rollup.setdefault(modality, {"modality": modality, "attempts": 0, "correct": 0})
-        modality_bucket["attempts"] += 1
-        if bool(attempt.is_correct):
-            modality_bucket["correct"] += 1
-
-        topic_key = (getattr(session, "lesson_focus", None) or getattr(task, "target_skill", None) or "general").strip() or "general"
-        topic_bucket = topic_rollup.setdefault(topic_key, {"area": topic_key, "attempts": 0, "correct": 0})
-        topic_bucket["attempts"] += 1
-        if bool(attempt.is_correct):
-            topic_bucket["correct"] += 1
-
-        task_type = (getattr(task, "task_type", None) or "unknown").strip() or "unknown"
-        task_type_bucket = task_type_rollup.setdefault(task_type, {"task_type": task_type, "attempts": 0, "correct": 0})
-        task_type_bucket["attempts"] += 1
-        if bool(attempt.is_correct):
-            task_type_bucket["correct"] += 1
-
-    modality_breakdown = []
-    for item in modality_rollup.values():
-        item["accuracy"] = round((item["correct"] / item["attempts"]) if item["attempts"] else 0.0, 4)
-        modality_breakdown.append(item)
-    modality_breakdown.sort(key=lambda x: x["modality"])
-
-    skill_breakdown = []
-    for item in topic_rollup.values():
-        item["accuracy"] = round((item["correct"] / item["attempts"]) if item["attempts"] else 0.0, 4)
-        skill_breakdown.append(item)
-    skill_breakdown.sort(key=lambda x: (x["accuracy"], x["area"]))
-
-    task_success_rates = []
-    for item in task_type_rollup.values():
-        item["success_rate"] = round((item["correct"] / item["attempts"]) if item["attempts"] else 0.0, 4)
-        task_success_rates.append(item)
-    task_success_rates.sort(key=lambda x: x["task_type"])
-
-    strengths = [x for x in skill_breakdown if x["attempts"] > 0]
-    strengths = sorted(strengths, key=lambda x: (-x["accuracy"], -x["attempts"], x["area"]))[:3]
-
-    weaknesses = [x for x in skill_breakdown if x["attempts"] > 0]
-    weaknesses = sorted(weaknesses, key=lambda x: (x["accuracy"], -x["attempts"], x["area"]))[:3]
-
-    recent_activity = []
-    for attempt, task, session in attempts[-12:][::-1]:
-        recent_activity.append({
-            "attempt_id": int(attempt.id),
-            "created_at": attempt.created_at.isoformat() if getattr(attempt, "created_at", None) else None,
-            "task_type": getattr(task, "task_type", None) or "unknown",
-            "lesson_focus": getattr(session, "lesson_focus", None) or "general",
-            "is_correct": bool(attempt.is_correct),
-            "response_time_ms": int(attempt.response_time_ms or 0),
-        })
-
-    return {
-        "child_id": int(child_id),
-        "child_name": child.display_name,
-        "current_level": int(getattr(child, "current_level", 1) or 1),
-        "max_level": int(getattr(child, "max_level", 5) or 5),
-        "total_attempts": int(total),
-        "correct": int(correct),
-        "accuracy": float(accuracy),
-        "avg_response_time_ms": int(avg_response_time_ms),
-        "current_streak": int(current_streak),
-        "points_last_7_days": points_last_7_days,
-        "performance_trend": performance_trend,
-        "modality_breakdown": modality_breakdown,
-        "skill_breakdown": skill_breakdown,
-        "task_success_rates": task_success_rates,
-        "strengths": strengths,
-        "weaknesses": weaknesses,
-        "recent_activity": recent_activity,
-    }
-
 # -------- Caregiver: Children CRUD --------
 
 @app.get("/caregiver/children", response_model=List[ChildOut])
@@ -1420,10 +1180,10 @@ def caregiver_delete_child(child_id: int, db=Depends(get_db), user: User = Depen
 
 
 @app.get("/children/public", response_model=List[PublicChildOut])
-def children_public(limit: int = 50, db: Session = Depends(get_db), user: User = Depends(require_role("caregiver"))):
+def children_public(limit: int = 50, db: Session = Depends(get_db)):
+    # MVP: no auth, return minimal non-sensitive fields only
     rows = (
         db.query(Child)
-        .filter(Child.caregiver_id == user.id)
         .order_by(Child.created_at.desc() if hasattr(Child, "created_at") else Child.id.desc())
         .limit(limit)
         .all()
@@ -1440,8 +1200,7 @@ def children_public(limit: int = 50, db: Session = Depends(get_db), user: User =
 
 
 @app.get("/caregiver/settings/{child_id}", response_model=SettingsResponse)
-def get_settings(child_id: int, db=Depends(get_db), user: User = Depends(require_role("caregiver"))):
-    _child_owned_by_user(db, child_id, user)
+def get_settings(child_id: int, db=Depends(get_db)):
     row = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == child_id).first()
     if not row:
         # Create default settings on first read (non-breaking)
@@ -1453,8 +1212,7 @@ def get_settings(child_id: int, db=Depends(get_db), user: User = Depends(require
 
 
 @app.post("/caregiver/settings")
-def update_settings(payload: SettingsUpdateRequest, db=Depends(get_db), user: User = Depends(require_role("caregiver"))):
-    _child_owned_by_user(db, payload.child_id, user)
+def update_settings(payload: SettingsUpdateRequest, db=Depends(get_db)):
     row = db.query(CaregiverSettings).filter(CaregiverSettings.child_id == payload.child_id).first()
     if not row:
         row = CaregiverSettings(child_id=payload.child_id, session_minutes=payload.session_minutes, sound_on=payload.sound_on)
@@ -1471,12 +1229,13 @@ def update_settings(payload: SettingsUpdateRequest, db=Depends(get_db), user: Us
 # -------- Gameplay: Sessions & Tasks (kept stable for existing app) --------
 
 @app.post("/sessions/start", response_model=StartSessionResponse)
-def start_session(
-    payload: StartSessionRequest,
-    db=Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    child = _child_owned_by_user(db, payload.child_id, user, allow_teacher=True)
+def start_session(payload: StartSessionRequest, db=Depends(get_db)):
+    # Validate child exists
+    child = db.query(Child).filter(Child.id == payload.child_id).first()
+    if not child:
+        raise HTTPException(status_code=404, detail="Child not found")
+
+    # Validate lesson focus topic exists OR still allow if lexicon exists
     topic_key = payload.lesson_focus.strip()
 
     session = Session(child_id=payload.child_id, lesson_focus=topic_key)
@@ -1484,6 +1243,7 @@ def start_session(
     db.commit()
     db.refresh(session)
 
+    # Create first task
     task_id, task_payload = _create_next_task(db, session.id, payload.child_id)
     return {"session_id": int(session.id), "task_id": int(task_id), "task": task_payload}
 
@@ -1493,40 +1253,34 @@ def _create_next_task(db, session_id: int, child_id: int) -> (int, Dict[str, Any
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    # adaptive difficulty: clamp to child current_level
     child = db.query(Child).filter(Child.id == child_id).first()
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
+    difficulty = int(child.current_level) if child else 1
+    difficulty = max(1, min(5, difficulty))
 
-    difficulty = _infer_difficulty_from_session(db, session_id, child)
+    # pick a target lexicon item (prefer unseen / low mastery)
     topic_key = session.lesson_focus
 
+    # Fetch candidates
     candidates = db.query(LexiconItem).filter(LexiconItem.topic == topic_key).all()
     if not candidates:
+        # fallback: any lexicon items
         candidates = db.query(LexiconItem).all()
         if not candidates:
             raise HTTPException(status_code=400, detail="No lexicon items available")
 
-    pool = [c for c in candidates if int(getattr(c, "difficulty", 1) or 1) == difficulty]
-    if not pool:
-        pool = [c for c in candidates if abs(int(getattr(c, "difficulty", 1) or 1) - difficulty) <= 1] or candidates
+    target = random.choice(candidates)
 
-    target = random.choice(pool)
+    # Build options
     target, options = _pick_lexicon_options(db, target.topic, difficulty, 4, int(target.id))
-
-    if difficulty >= 2:
-        task_payload = _build_match_image_task(target.topic, target, options, difficulty)
-        modality = "image"
-    else:
-        task_payload = _build_match_word_task(target.topic, target, options)
-        task_payload["meta"] = {"difficulty": int(difficulty), "visual_focus": False}
-        modality = "mixed"
+    task_payload = _build_match_word_task(target.topic, target, options)
 
     task = Task(
         session_id=session_id,
         task_type=task_payload["task_type"],
         target_skill="vocabulary",
         difficulty=difficulty,
-        modality=modality,
+        modality="mixed",
         payload_json=task_payload,
         generated_by="template",
         approved=True,
@@ -1539,15 +1293,13 @@ def _create_next_task(db, session_id: int, child_id: int) -> (int, Dict[str, Any
 
 
 @app.post("/tasks/next", response_model=NextTaskResponse)
-def next_task(payload: NextTaskRequest, db=Depends(get_db), user: User = Depends(get_current_user)):
-    _session_owned_by_user(db, payload.session_id, payload.child_id, user, allow_teacher=True)
+def next_task(payload: NextTaskRequest, db=Depends(get_db)):
     task_id, task_payload = _create_next_task(db, payload.session_id, payload.child_id)
     return {"task_id": int(task_id), "task": task_payload}
 
 
 @app.post("/tasks/submit", response_model=SubmitTaskResponse)
-def submit_task(payload: SubmitTaskRequest, db=Depends(get_db), user: User = Depends(get_current_user)):
-    _session_owned_by_user(db, payload.session_id, payload.child_id, user, allow_teacher=True)
+def submit_task(payload: SubmitTaskRequest, db=Depends(get_db)):
     task = db.query(Task).filter(Task.id == payload.task_id, Task.session_id == payload.session_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1577,6 +1329,7 @@ def submit_task(payload: SubmitTaskRequest, db=Depends(get_db), user: User = Dep
     )
     db.add(attempt)
 
+    # Update mastery best-effort
     try:
         target_id = int(correct_answer) if correct_answer and correct_answer.isdigit() else None
         if target_id:
@@ -1587,39 +1340,23 @@ def submit_task(payload: SubmitTaskRequest, db=Depends(get_db), user: User = Dep
 
             if is_correct:
                 m.correct_count += 1
-                m.mastery_score = min(1.0, float(m.mastery_score) + 0.08)
+                m.mastery_score = min(1.0, float(m.mastery_score) + 0.05)
             else:
                 m.wrong_count += 1
-                m.mastery_score = max(0.0, float(m.mastery_score) - 0.04)
+                m.mastery_score = max(0.0, float(m.mastery_score) - 0.02)
             m.last_seen = datetime.now(timezone.utc)
 
-        child = db.query(Child).filter(Child.id == payload.child_id).first()
-        if child:
-            recent_attempts = (
-                db.query(TaskAttempt)
-                .join(Task, Task.id == TaskAttempt.task_id)
-                .filter(Task.session_id == payload.session_id, TaskAttempt.child_id == payload.child_id)
-                .order_by(TaskAttempt.id.desc())
-                .limit(1)
-                .all()
-            )
-            previous_correct = len(recent_attempts) >= 1 and bool(recent_attempts[0].is_correct)
-            if is_correct and previous_correct:
-                child.current_level = min(int(child.max_level or 5), max(1, int(child.current_level or 1)) + 1)
-            elif (not is_correct) and previous_correct is False:
-                child.current_level = max(int(child.min_level or 1), int(child.current_level or 1) - 1)
+            # Light level progression
+            child = db.query(Child).filter(Child.id == payload.child_id).first()
+            if child and is_correct:
+                child.current_level = min(child.max_level, int(child.current_level) + 0)
     except Exception:
         pass
 
     db.commit()
 
-    child = db.query(Child).filter(Child.id == payload.child_id).first()
     feedback_sw = "Vizuri sana!" if is_correct else "Jaribu tena."
-    reward = {
-        "coins": 1 if is_correct else 0,
-        "streak": 2 if is_correct else 0,
-        "level": int(getattr(child, "current_level", 1) or 1),
-    }
+    reward = {"coins": 1 if is_correct else 0, "streak": 0}
 
     return {"is_correct": bool(is_correct), "feedback_sw": feedback_sw, "reward": reward}
 
@@ -1627,54 +1364,72 @@ def submit_task(payload: SubmitTaskRequest, db=Depends(get_db), user: User = Dep
 # -------- Reports --------
 
 @app.get("/reports/child/{child_id}", response_model=ChildReportResponse)
-def child_report(child_id: int, db=Depends(get_db), user: User = Depends(get_current_user)):
-    _child_owned_by_user(db, child_id, user, allow_teacher=True)
-    return _report_for_child(db, child_id)
-
-
-@app.get("/teacher/reports/child/{child_id}", response_model=ChildReportResponse)
-def teacher_child_report(child_id: int, db=Depends(get_db), user: User = Depends(require_role("teacher"))):
-    child = db.query(Child).filter(Child.id == child_id).first()
-    if not child:
-        raise HTTPException(status_code=404, detail="Child not found")
-    return _report_for_child(db, child_id)
-
-@app.get("/caregiver/activity")
-def caregiver_activity(limit: int = 50, db=Depends(get_db), user: User = Depends(require_role("caregiver"))):
-    child_ids = [int(c.id) for c in db.query(Child).filter(Child.caregiver_id == user.id).all()]
-    if not child_ids:
-        return {"items": []}
-
-    rows = (
-        db.query(TaskAttempt, Task, Child, Session)
+def child_report(child_id: int, db=Depends(get_db)):
+    attempts = (
+        db.query(TaskAttempt, Task)
         .join(Task, Task.id == TaskAttempt.task_id)
-        .join(Session, Session.id == Task.session_id)
-        .join(Child, Child.id == TaskAttempt.child_id)
-        .filter(TaskAttempt.child_id.in_(child_ids))
-        .order_by(TaskAttempt.created_at.desc(), TaskAttempt.id.desc())
-        .limit(limit)
+        .filter(TaskAttempt.child_id == child_id)
+        .order_by(TaskAttempt.created_at.asc(), TaskAttempt.id.asc())
         .all()
     )
 
-    items = []
-    for attempt, task, child, session in rows:
-        items.append({
-            "attempt_id": int(attempt.id),
-            "child_id": int(child.id),
-            "child_name": child.display_name,
-            "lesson_focus": session.lesson_focus,
-            "task_type": task.task_type,
-            "is_correct": bool(attempt.is_correct),
-            "response_time_ms": int(attempt.response_time_ms or 0),
-            "created_at": attempt.created_at.isoformat() if getattr(attempt, "created_at", None) else None,
+    total = len(attempts)
+    correct = sum(1 for attempt, _task in attempts if bool(attempt.is_correct))
+    accuracy = (correct / total) if total else 0.0
+
+    avg_response_time_ms = 0
+    if total:
+        avg_response_time_ms = int(round(sum(max(0, int(attempt.response_time_ms or 0)) for attempt, _task in attempts) / total))
+
+    current_streak = 0
+    for attempt, _task in reversed(attempts):
+        if bool(attempt.is_correct):
+            current_streak += 1
+        else:
+            break
+
+    today = datetime.now(timezone.utc).date()
+    points_last_7_days = []
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        pts = 0
+        for attempt, _task in attempts:
+            created = attempt.created_at
+            if not created:
+                continue
+            created_day = created.date() if hasattr(created, "date") else created
+            if created_day == day and bool(attempt.is_correct):
+                pts += 1
+        points_last_7_days.append({
+            "date": day.isoformat(),
+            "label": day.strftime("%a"),
+            "points": int(pts),
         })
-    return {"items": items}
 
+    modality_rollup: Dict[str, Dict[str, Any]] = {}
+    for attempt, task in attempts:
+        modality = (getattr(task, "modality", None) or "mixed").strip() or "mixed"
+        bucket = modality_rollup.setdefault(modality, {"modality": modality, "attempts": 0, "correct": 0})
+        bucket["attempts"] += 1
+        if bool(attempt.is_correct):
+            bucket["correct"] += 1
 
-@app.get("/teacher/children/reports")
-def teacher_children_reports(db=Depends(get_db), user: User = Depends(require_role("teacher"))):
-    rows = db.query(Child).order_by(Child.created_at.desc(), Child.id.desc()).all()
-    return {"items": [_report_for_child(db, int(child.id)) for child in rows]}
+    modality_breakdown = []
+    for item in modality_rollup.values():
+        item["accuracy"] = round((item["correct"] / item["attempts"]) if item["attempts"] else 0.0, 4)
+        modality_breakdown.append(item)
+    modality_breakdown.sort(key=lambda x: x["modality"])
+
+    return {
+        "child_id": int(child_id),
+        "total_attempts": int(total),
+        "correct": int(correct),
+        "accuracy": float(round(accuracy, 4)),
+        "avg_response_time_ms": int(avg_response_time_ms),
+        "current_streak": int(current_streak),
+        "points_last_7_days": points_last_7_days,
+        "modality_breakdown": modality_breakdown,
+    }
 
 
 # -------- AI Task Generation (stable, never crashes) --------
